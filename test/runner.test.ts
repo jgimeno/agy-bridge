@@ -6,6 +6,7 @@ import {
   AgyRunError,
   buildArgs,
   collectRun,
+  stdinMessage,
   truncate,
   runAgy,
   execWithClosedStdin,
@@ -69,10 +70,12 @@ interface FakeOpts {
 /** A fake agy that writes its stream, stderr and log to the run's files, like the real one. */
 function fakeDeps(opts: FakeOpts = {}) {
   const kills: string[] = [];
+  let capturedArgs: string[] | undefined;
   let capturedOpts: SpawnOptions | undefined;
 
   const deps: RunnerDeps = {
     spawnChild: (_file, args, spawnOpts) => {
+      capturedArgs = args;
       capturedOpts = spawnOpts;
       let resolveExit!: (v: { code: number | null; error?: NodeJS.ErrnoException }) => void;
       const exit = new Promise<{ code: number | null; error?: NodeJS.ErrnoException }>(
@@ -109,7 +112,7 @@ function fakeDeps(opts: FakeOpts = {}) {
     killGraceMs: 5,
   };
 
-  return { deps, kills, spawnOpts: () => capturedOpts };
+  return { deps, kills, args: () => capturedArgs, spawnOpts: () => capturedOpts };
 }
 
 const req = (fields: Partial<RunRequest> = {}): RunRequest => ({
@@ -124,7 +127,7 @@ describe("buildArgs", () => {
   it("builds full arg list with log file, stream output and per-request timeout", () => {
     expect(
       buildArgs(
-        { prompt: "hi", cwd: "/repo", model: "Gemini 3.1 Pro (High)", timeoutSec: 120 },
+        { cwd: "/repo", model: "Gemini 3.1 Pro (High)", timeoutSec: 120 },
         cfg,
         "/tmp/run.log",
       ),
@@ -136,18 +139,18 @@ describe("buildArgs", () => {
       "/tmp/run.log",
       "--model",
       "Gemini 3.1 Pro (High)",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
       "--print-timeout",
       "120s",
-      "-p",
-      "hi",
     ]);
   });
 
   it("falls back to cfg timeout; adds --conversation and --sandbox when set", () => {
     const args = buildArgs(
-      { prompt: "q", cwd: "/repo", conversationId: "abc-123" },
+      { cwd: "/repo", conversationId: "abc-123" },
       { ...cfg, sandbox: true, skipPermissions: false },
       "/tmp/run.log",
     );
@@ -159,13 +162,26 @@ describe("buildArgs", () => {
       "/tmp/run.log",
       "--conversation",
       "abc-123",
+      "--input-format",
+      "stream-json",
       "--output-format",
       "stream-json",
       "--print-timeout",
       "600s",
-      "-p",
-      "q",
     ]);
+  });
+});
+
+describe("stdinMessage", () => {
+  it("wraps the prompt in one stream-json user event, newlines and quotes intact", () => {
+    const prompt = 'Review this:\n+ const s = "x";';
+    const line = stdinMessage(prompt);
+    expect(line.endsWith("\n")).toBe(true);
+    expect(line.trimEnd()).not.toContain("\n");
+    expect(JSON.parse(line)).toEqual({
+      event: "user",
+      message: { role: "user", content: prompt },
+    });
   });
 });
 
@@ -252,6 +268,8 @@ describe("runAgy", () => {
     const r = await runAgy(req(), cfg, f.deps);
     expect(r).toMatchObject({ state: "done", output: "answer", sessionId: "conv-9" });
     expect(f.spawnOpts()!.outPath).toBe(runPaths(cfg.runsDir, r.meta.runId).out);
+    expect(f.spawnOpts()!.input).toBe(stdinMessage("q"));
+    expect(f.args()).not.toContain("q");
   });
 
   it("hands back the session id and progress when the wait runs out, and collects the answer later", async () => {
