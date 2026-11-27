@@ -265,6 +265,20 @@ describe("createResultHandler", () => {
     expect(textOf(res)).toContain("session: sess-1 (use follow_up to continue)");
   });
 
+  it("cools down a model whose quota ran out after the hand-off, so a re-run skips it", async () => {
+    const f = fakeDeps({ answerAfterMs: Infinity });
+    const cooldowns = new CooldownRegistry();
+    const delegate = handlerFor("delegate", f, { waitSec: 0.02 }, cooldowns);
+    await delegate({ prompt: "x" });
+    const [run] = f.runs;
+    writeFileSync(run.args[run.args.indexOf("--log-file") + 1], LOG_429);
+
+    const res = await createResultHandler(cfg, f.deps, cooldowns)({ session_id: "sess-1" });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/Quota exhausted for Gemini 3.8 Flash \(High\).*again/s);
+    expect(cooldowns.cooling("Gemini 3.8 Flash (High)")).toBe(true);
+  });
+
   it("reports an unknown session as an error pointing to follow_up", async () => {
     const res = await createResultHandler(cfg, fakeDeps().deps)({ session_id: "nope" });
     expect(res.isError).toBe(true);

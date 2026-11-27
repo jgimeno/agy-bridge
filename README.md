@@ -105,6 +105,7 @@ A review that explores the repository can keep agy busy for ten minutes or more,
 - A call waits up to `AGY_WAIT_SEC` for the answer. If agy is still working, it returns without an error, saying how far agy has got (`37 tool calls so far, last: read_file …/server.ts`) and giving a `session_id`.
 - `get_result` with that `session_id` waits again (up to its `wait_sec`, or `AGY_WAIT_SEC`) and returns the answer, or more progress. It works from a new bridge process too, as long as the run's files are there. Cancelling `get_result` stops the wait, not agy.
 - When a run fails, or agy's own time limit ends the turn, the error names the conversation's `session_id` and includes any partial answer; `follow_up` can continue that conversation, for example to ask for its answer so far.
+- If a model's quota runs out after the hand-off, `get_result` can't fail over, since it doesn't have the prompt. It puts the model in cooldown and asks for the original call to be made again, which then goes to the next model in the chain.
 
 The prompt reaches agy on stdin, so a large diff passed to `adversarial_review` doesn't show in the process list or hit the argument-size limit.
 
