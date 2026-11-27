@@ -208,7 +208,7 @@ export const defaultDeps: RunnerDeps = {
 };
 
 export function buildArgs(
-  req: Pick<RunRequest, "prompt" | "cwd" | "model" | "conversationId" | "timeoutSec">,
+  req: Pick<RunRequest, "cwd" | "model" | "conversationId" | "timeoutSec">,
   cfg: Config,
   logPath: string,
 ): string[] {
@@ -220,9 +220,16 @@ export function buildArgs(
   args.push("--log-file", logPath);
   if (req.conversationId) args.push("--conversation", req.conversationId);
   if (req.model) args.push("--model", req.model);
-  args.push("--output-format", "stream-json");
-  args.push("--print-timeout", `${timeoutSec}s`, "-p", req.prompt);
+  // The prompt goes over stdin (see stdinMessage): an argument would show it in
+  // `ps` and hit the OS argument-size limit with a large diff to review.
+  args.push("--input-format", "stream-json", "--output-format", "stream-json");
+  args.push("--print-timeout", `${timeoutSec}s`);
   return args;
+}
+
+/** The prompt as the one user message agy's `--input-format stream-json` reads from stdin. */
+export function stdinMessage(prompt: string): string {
+  return `${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`;
 }
 
 export function truncate(text: string, max: number): { text: string; truncated: boolean } {
@@ -266,6 +273,7 @@ export async function runAgy(
 
   const child = deps.spawnChild(cfg.agyPath, buildArgs(req, cfg, paths.log), {
     cwd: req.cwd,
+    input: stdinMessage(req.prompt),
     outPath: paths.out,
     errPath: paths.err,
   });
