@@ -14,10 +14,12 @@ describe.skipIf(!process.env.AGY_E2E)("live quota detection", () => {
       const started = Date.now();
       const err = await runAgy(
         {
+          tool: "delegate",
           prompt: "say ok",
           cwd: process.cwd(),
           model: "Claude Sonnet 4.6 (Thinking)",
           timeoutSec: 45,
+          waitSec: 45,
         },
         loadConfig(),
       ).catch((e) => e as Error);

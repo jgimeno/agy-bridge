@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { loadConfig } from "../src/config.js";
+import { DEFAULT_RUNS_DIR } from "../src/runs.js";
 
 describe("loadConfig", () => {
   it("returns defaults for empty env", () => {
@@ -14,7 +15,15 @@ describe("loadConfig", () => {
       skipPermissions: true,
       sandbox: false,
       onFailure: "fallback",
+      waitSec: 240,
+      runsDir: DEFAULT_RUNS_DIR,
     });
+  });
+
+  it("reads AGY_WAIT_SEC and AGY_RUNS_DIR", () => {
+    const c = loadConfig({ AGY_WAIT_SEC: "600", AGY_RUNS_DIR: "/tmp/runs" });
+    expect(c.waitSec).toBe(600);
+    expect(c.runsDir).toBe("/tmp/runs");
   });
 
   it("reads overrides from env", () => {
