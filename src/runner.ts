@@ -1,47 +1,81 @@
 import { execFile, spawn } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { promisify } from "node:util";
-import { readFile, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import type { Config } from "./config.js";
 import { detectQuota, QuotaError } from "./quota.js";
+import {
+  StreamReader,
+  describeProgress,
+  findRun,
+  pruneRuns,
+  runPaths,
+  writeMeta,
+  type RunMeta,
+  type StreamState,
+} from "./runs.js";
 
 const execFileAsync = promisify(execFile);
 
 export interface RunRequest {
+  /** The tool that started the run, recorded with it. */
+  tool: string;
   prompt: string;
   cwd: string;
   model?: string;
   conversationId?: string;
-  /** Per-call timeout; falls back to cfg.timeoutSec. */
+  /** agy's own time limit for the whole run; falls back to cfg.timeoutSec. */
   timeoutSec?: number;
+  /** How long this call waits for the answer before handing back the session id. */
+  waitSec: number;
   /** MCP cancellation signal — kills the agy process when aborted. */
   signal?: AbortSignal;
 }
 
-export interface RunResult {
-  output: string;
-  truncated: boolean;
-  sessionId?: string;
+export type RunOutcome =
+  | { state: "done"; output: string; truncated: boolean; sessionId?: string; meta: RunMeta }
+  | {
+      state: "running";
+      /** The conversation id, or the run id while agy hasn't reported one yet. */
+      sessionId: string;
+      progress: string;
+      elapsedSec: number;
+      meta: RunMeta;
+    };
+
+/** A failed run, carrying the conversation id when agy reported one so it can be continued. */
+export class AgyRunError extends Error {
+  constructor(
+    message: string,
+    readonly sessionId?: string,
+  ) {
+    super(message);
+    this.name = "AgyRunError";
+  }
 }
 
 export interface ChildHandle {
-  stdout(): string;
-  stderr(): string;
-  /** Settles when the process is fully done (exit + closed pipes, or spawn error). */
+  pid?: number;
+  /** Settles when the process exits, or fails to spawn. */
   wait(): Promise<{ code: number | null; error?: NodeJS.ErrnoException }>;
   /** Signals the whole process group so web-search helpers can't outlive agy. */
   kill(signal: NodeJS.Signals): void;
 }
 
+export interface SpawnOptions {
+  cwd: string;
+  /** Written to stdin, which is then closed; agy reads stdin until EOF. */
+  input?: string;
+  outPath: string;
+  errPath: string;
+}
+
 export interface RunnerDeps {
-  spawnChild(file: string, args: string[], cwd: string): ChildHandle;
-  readLog(logPath: string): Promise<string>;
-  removeLog(logPath: string): Promise<void>;
-  readSessionsFile(): Promise<string>;
-  makeLogPath(): string;
-  /** How often to scan the run log for quota errors. */
+  spawnChild(file: string, args: string[], opts: SpawnOptions): ChildHandle;
+  /** Whether a run's process is still alive when this server didn't start it. */
+  isAlive(pid: number): boolean;
+  /** How often to read the run's stream and log. */
   pollMs?: number;
   /** Extra wait beyond agy's own --print-timeout before we hard-kill. */
   graceMs?: number;
@@ -55,23 +89,12 @@ export type ExecFn = (
   options: { cwd: string; timeout: number; maxBuffer: number },
 ) => Promise<{ stdout: string; stderr: string }>;
 
-export const SESSIONS_FILE = path.join(
-  homedir(),
-  ".gemini",
-  "antigravity-cli",
-  "cache",
-  "last_conversations.json",
-);
-
 // agy reads stdin until EOF even in print mode; an open stdin pipe hangs it forever.
 export const execWithClosedStdin: ExecFn = (file, args, options) => {
   const promise = execFileAsync(file, args, { windowsHide: true, ...options });
   promise.child.stdin?.end();
   return promise;
 };
-
-const MAX_STDOUT_CHARS = 64 * 1024 * 1024;
-const MAX_STDERR_CHARS = 1024 * 1024;
 
 /**
  * Subprocess executor used by treeKill (taskkill on Windows). Injectable so the
@@ -120,41 +143,36 @@ export async function treeKill(
   }
 }
 
-function spawnDetached(file: string, args: string[], cwd: string): ChildHandle {
-  // detached gives POSIX a process group to kill; on Windows it maps to
-  // DETACHED_PROCESS, which makes agy and its MCP children pop console windows (#20).
-  const child = spawn(file, args, {
-    cwd,
-    detached: process.platform !== "win32",
-    windowsHide: true,
-  });
-  child.stdin?.end();
-
-  let out = "";
-  let err = "";
-  child.stdout?.on("data", (d: Buffer) => {
-    if (out.length < MAX_STDOUT_CHARS) out += d.toString();
-  });
-  child.stderr?.on("data", (d: Buffer) => {
-    if (err.length < MAX_STDERR_CHARS) err += d.toString();
-  });
+function spawnDetached(file: string, args: string[], opts: SpawnOptions): ChildHandle {
+  // agy writes straight to the run's files rather than to pipes, so it keeps
+  // running, and its answer stays readable, if this server exits.
+  const out = openSync(opts.outPath, "a", 0o600);
+  const err = openSync(opts.errPath, "a", 0o600);
+  let child;
+  try {
+    // detached gives POSIX a process group to kill; on Windows it maps to
+    // DETACHED_PROCESS, which makes agy and its MCP children pop console windows (#20).
+    child = spawn(file, args, {
+      cwd: opts.cwd,
+      detached: process.platform !== "win32",
+      windowsHide: true,
+      stdio: [opts.input === undefined ? "ignore" : "pipe", out, err],
+    });
+  } finally {
+    closeSync(out);
+    closeSync(err);
+  }
+  if (child.stdin) {
+    child.stdin.on("error", () => {}); // agy exiting early must not crash the server
+    child.stdin.end(opts.input);
+  }
+  child.unref();
 
   let exited = false;
   const done = new Promise<{ code: number | null; error?: NodeJS.ErrnoException }>((resolve) => {
-    let exitCode: number | null = null;
-    // "close" needs all pipes shut; orphaned grandchildren can hold them open
-    // forever, so resolve from "exit" after a short grace if "close" never fires.
-    let closeFallback: NodeJS.Timeout | undefined;
     child.on("exit", (code) => {
       exited = true;
-      exitCode = code;
-      closeFallback = setTimeout(() => resolve({ code: exitCode }), 2000);
-      closeFallback.unref();
-    });
-    child.on("close", (code) => {
-      exited = true;
-      if (closeFallback) clearTimeout(closeFallback);
-      resolve({ code: code ?? exitCode });
+      resolve({ code });
     });
     child.on("error", (e) => {
       exited = true;
@@ -163,8 +181,7 @@ function spawnDetached(file: string, args: string[], cwd: string): ChildHandle {
   });
 
   return {
-    stdout: () => out,
-    stderr: () => err,
+    pid: child.pid,
     wait: () => done,
     kill: (signal) => {
       // No-op once the child exited: its (negative) PID may already belong to
@@ -176,21 +193,25 @@ function spawnDetached(file: string, args: string[], cwd: string): ChildHandle {
   };
 }
 
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 export const defaultDeps: RunnerDeps = {
   spawnChild: spawnDetached,
-  readLog: async (logPath) => {
-    try {
-      return await readFile(logPath, "utf8");
-    } catch {
-      return "";
-    }
-  },
-  removeLog: (logPath) => rm(logPath, { force: true }),
-  readSessionsFile: () => readFile(SESSIONS_FILE, "utf8"),
-  makeLogPath: () => path.join(tmpdir(), `agy-bridge-${process.pid}-${randomUUID()}.log`),
+  isAlive: isProcessAlive,
 };
 
-export function buildArgs(req: RunRequest, cfg: Config, logPath: string): string[] {
+export function buildArgs(
+  req: Pick<RunRequest, "prompt" | "cwd" | "model" | "conversationId" | "timeoutSec">,
+  cfg: Config,
+  logPath: string,
+): string[] {
   const timeoutSec = req.timeoutSec ?? cfg.timeoutSec;
   const args: string[] = [];
   if (cfg.skipPermissions) args.push("--dangerously-skip-permissions");
@@ -199,6 +220,7 @@ export function buildArgs(req: RunRequest, cfg: Config, logPath: string): string
   args.push("--log-file", logPath);
   if (req.conversationId) args.push("--conversation", req.conversationId);
   if (req.model) args.push("--model", req.model);
+  args.push("--output-format", "stream-json");
   args.push("--print-timeout", `${timeoutSec}s`, "-p", req.prompt);
   return args;
 }
@@ -213,133 +235,237 @@ export function truncate(text: string, max: number): { text: string; truncated: 
   };
 }
 
+/** Children this server started, so their exit is seen directly instead of by polling the PID. */
+interface LiveRun {
+  child: ChildHandle;
+  exit?: { code: number | null; error?: NodeJS.ErrnoException };
+}
+const liveRuns = new Map<string, LiveRun>();
+
+/**
+ * Starts agy and waits up to `req.waitSec` for its answer. agy keeps running
+ * after that; its stream stays on disk for `collectRun`.
+ */
 export async function runAgy(
   req: RunRequest,
   cfg: Config,
   deps: RunnerDeps = defaultDeps,
-): Promise<RunResult> {
-  const timeoutSec = req.timeoutSec ?? cfg.timeoutSec;
+): Promise<RunOutcome> {
+  void pruneRuns(cfg.runsDir).catch(() => {});
+  const meta: RunMeta = {
+    runId: randomUUID(),
+    tool: req.tool,
+    model: req.model,
+    cwd: req.cwd,
+    startedAt: Date.now(),
+    timeoutSec: req.timeoutSec ?? cfg.timeoutSec,
+    conversationId: req.conversationId,
+  };
+  const paths = runPaths(cfg.runsDir, meta.runId);
+  await writeMeta(cfg.runsDir, meta);
+
+  const child = deps.spawnChild(cfg.agyPath, buildArgs(req, cfg, paths.log), {
+    cwd: req.cwd,
+    outPath: paths.out,
+    errPath: paths.err,
+  });
+  const live: LiveRun = { child };
+  liveRuns.set(meta.runId, live);
+  void child.wait().then((exit) => {
+    live.exit = exit;
+    // Keep the record a little longer than any wait could still be reading it.
+    setTimeout(() => liveRuns.delete(meta.runId), 60_000).unref?.();
+  });
+
+  meta.pid = child.pid;
+  await writeMeta(cfg.runsDir, meta);
+
+  // agy's --print-timeout should end the run first; this catches an agy that doesn't.
+  const graceMs = deps.graceMs ?? 15_000;
+  const watchdog = setTimeout(
+    () => {
+      if (!live.exit) killRun(live, deps);
+    },
+    meta.timeoutSec * 1000 + graceMs,
+  );
+  watchdog.unref?.();
+  void child.wait().then(() => clearTimeout(watchdog));
+
+  return awaitRun(meta, req.waitSec, cfg, deps, req.signal);
+}
+
+/** Waits up to `waitSec` for a run started earlier, by its session (conversation) id or run id. */
+export async function collectRun(
+  sessionId: string,
+  waitSec: number,
+  cfg: Config,
+  deps: RunnerDeps = defaultDeps,
+  signal?: AbortSignal,
+): Promise<RunOutcome> {
+  const meta = await findRun(cfg.runsDir, sessionId);
+  if (!meta) {
+    throw new AgyRunError(
+      `No agy-bridge run of session ${sessionId} is recorded in ${cfg.runsDir}. ` +
+        `follow_up can still ask that conversation for its answer.`,
+      sessionId,
+    );
+  }
+  return awaitRun(meta, waitSec, cfg, deps, signal, false);
+}
+
+function killRun(live: LiveRun, deps: RunnerDeps): void {
+  live.child.kill("SIGTERM");
+  // Escalation must outlive the wait — kill() no-ops once the child has exited.
+  const escalate = setTimeout(() => live.child.kill("SIGKILL"), deps.killGraceMs ?? 5_000);
+  escalate.unref?.();
+}
+
+async function awaitRun(
+  meta: RunMeta,
+  waitSec: number,
+  cfg: Config,
+  deps: RunnerDeps,
+  signal: AbortSignal | undefined,
+  cancelKills = true,
+): Promise<RunOutcome> {
+  const paths = runPaths(cfg.runsDir, meta.runId);
+  const reader = new StreamReader(paths.out);
   const pollMs = deps.pollMs ?? 1000;
   const graceMs = deps.graceMs ?? 15_000;
-  const killGraceMs = deps.killGraceMs ?? 5_000;
-  const logPath = deps.makeLogPath();
+  const waitStart = Date.now();
+  const deadline = meta.startedAt + meta.timeoutSec * 1000 + graceMs;
+  const sessionOf = (state: StreamState) => state.conversationId ?? meta.conversationId;
 
-  const stdout = await new Promise<string>((resolve, reject) => {
-    const child = deps.spawnChild(cfg.agyPath, buildArgs(req, cfg, logPath), req.cwd);
+  for (;;) {
+    const state = await reader.poll();
+    if (state.result) return finish(meta, state, cfg);
 
-    let settled = false;
-    let polling = false;
-    const timers: NodeJS.Timeout[] = [];
-
-    const killChild = () => {
-      child.kill("SIGTERM");
-      // Escalation must survive finish()'s cleanup — kill() no-ops once the
-      // child has exited, and unref keeps it from holding the process open.
-      const escalate = setTimeout(() => child.kill("SIGKILL"), killGraceMs);
-      escalate.unref?.();
-    };
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(poller);
-      for (const t of timers) clearTimeout(t);
-      req.signal?.removeEventListener("abort", onAbort);
-      fn();
-    };
-
-    const poller = setInterval(async () => {
-      if (polling || settled) return;
-      polling = true;
-      try {
-        const log = await deps.readLog(logPath);
-        if (settled) return; // settled during the async read — don't kill a finished run
-        const quota = detectQuota(log);
-        if (quota) {
-          killChild();
-          finish(() => reject(new QuotaError(req.model, quota)));
-        }
-      } finally {
-        polling = false;
-      }
-    }, pollMs);
-
-    // Hard deadline independent of the child's pipes: agy's own --print-timeout
-    // should fire first; if it doesn't, reject without waiting for "close".
-    timers.push(
-      setTimeout(
-        () => {
-          killChild();
-          finish(() =>
-            reject(new Error(`agy timed out after ${timeoutSec}s (AGY_TIMEOUT to adjust).`)),
-          );
-        },
-        timeoutSec * 1000 + graceMs,
-      ),
-    );
-
-    const onAbort = () => {
-      killChild();
-      finish(() => reject(new Error("agy run cancelled by client.")));
-    };
-    if (req.signal?.aborted) {
-      onAbort();
-      return;
+    const quota = detectQuota(await readText(paths.log));
+    const live = liveRuns.get(meta.runId);
+    if (quota) {
+      if (live) killRun(live, deps);
+      throw new QuotaError(meta.model, quota);
     }
-    req.signal?.addEventListener("abort", onAbort, { once: true });
 
-    void child.wait().then(async ({ code, error }) => {
-      if (settled) return;
-      if (error?.code === "ENOENT") {
-        finish(() =>
-          reject(
-            new Error(
-              `agy CLI not found at "${cfg.agyPath}". Install the Antigravity CLI ` +
-                `(https://antigravity.google/docs/cli-getting-started) or set AGY_PATH.`,
-            ),
-          ),
-        );
-        return;
-      }
-      if (error) {
-        finish(() => reject(new Error(`agy failed: ${error.message}`)));
-        return;
-      }
-      const out = child.stdout().trim();
-      if (code !== 0) {
-        const stderr = child.stderr().trim();
-        finish(() =>
-          reject(new Error(stderr ? `agy failed: ${stderr}` : `agy exited with code ${code}.`)),
-        );
-        return;
-      }
-      if (!out) {
-        // agy swallows quota errors and exits 0 with empty output after its
-        // print-timeout — check the log before reporting anything as success.
-        const quota = detectQuota(await deps.readLog(logPath));
-        finish(() =>
-          reject(
-            quota
-              ? new QuotaError(req.model, quota)
-              : new Error(
-                  "agy returned empty output (likely hit its print-timeout without a response).",
-                ),
-          ),
-        );
-        return;
-      }
-      finish(() => resolve(out));
-    });
-  }).finally(() => void deps.removeLog(logPath).catch(() => {}));
+    if (signal?.aborted) {
+      // Only the call that started agy stops it; a caller collecting the result just stops waiting.
+      if (live && cancelKills) killRun(live, deps);
+      throw new AgyRunError("agy run cancelled by client.", sessionOf(state));
+    }
 
-  const { text, truncated } = truncate(stdout, cfg.maxOutputChars);
+    const exit = live ? live.exit : meta.pid && !deps.isAlive(meta.pid) ? {} : undefined;
+    if (exit) {
+      // It may have written its result just before exiting.
+      const last = await reader.poll();
+      if (last.result) return finish(meta, last, cfg);
+      throw await stoppedWithoutResult(meta, last, exit, sessionOf(last), cfg);
+    }
 
-  let sessionId: string | undefined;
-  try {
-    const map = JSON.parse(await deps.readSessionsFile()) as Record<string, string>;
-    sessionId = map[path.resolve(req.cwd)];
-  } catch {
-    sessionId = undefined;
+    if (Date.now() > deadline) {
+      if (live) killRun(live, deps);
+      throw new AgyRunError(
+        `agy didn't stop at its ${meta.timeoutSec}s time limit, so it was stopped ` +
+          `(${describeProgress(state)}).`,
+        sessionOf(state),
+      );
+    }
+
+    const elapsedMs = Date.now() - waitStart;
+    if (elapsedMs >= waitSec * 1000) {
+      return {
+        state: "running",
+        sessionId: sessionOf(state) ?? meta.runId,
+        progress: describeProgress(state),
+        elapsedSec: Math.round((Date.now() - meta.startedAt) / 1000),
+        meta,
+      };
+    }
+    await sleep(Math.min(pollMs, waitSec * 1000 - elapsedMs), signal);
+  }
+}
+
+async function finish(meta: RunMeta, state: StreamState, cfg: Config): Promise<RunOutcome> {
+  const result = state.result!;
+  const sessionId = state.conversationId ?? meta.conversationId;
+  const response = result.response.trim();
+
+  if (result.finishedReason === "print_timeout") {
+    const limit = `agy's ${meta.timeoutSec}s time limit ended the turn`;
+    throw new AgyRunError(
+      response
+        ? `${limit} before it finished (${describeProgress(state)}). Its partial answer:\n\n${response}`
+        : `${limit} before it answered (${describeProgress(state)}).`,
+      sessionId,
+    );
   }
 
-  return { output: text, truncated, sessionId };
+  if (result.status !== "SUCCESS" || result.finishedReason || !response) {
+    const quota = detectQuota(
+      `${await readText(runPaths(cfg.runsDir, meta.runId).log)}\n${result.error ?? ""}`,
+    );
+    if (quota) throw new QuotaError(meta.model, quota);
+    throw new AgyRunError(
+      response
+        ? `agy failed: ${result.error ?? result.finishedReason ?? result.status}`
+        : `agy returned no answer${result.error ? `: ${result.error}` : "."}`,
+      sessionId,
+    );
+  }
+
+  const { text, truncated } = truncate(response, cfg.maxOutputChars);
+  return { state: "done", output: text, truncated, sessionId, meta };
+}
+
+async function stoppedWithoutResult(
+  meta: RunMeta,
+  state: StreamState,
+  exit: { code?: number | null; error?: NodeJS.ErrnoException },
+  sessionId: string | undefined,
+  cfg: Config,
+): Promise<Error> {
+  if (exit.error?.code === "ENOENT") {
+    return new Error(
+      `agy CLI not found at "${cfg.agyPath}". Install the Antigravity CLI ` +
+        `(https://antigravity.google/docs/cli-getting-started) or set AGY_PATH.`,
+    );
+  }
+  if (exit.error) return new AgyRunError(`agy failed: ${exit.error.message}`, sessionId);
+  const stderr = (await readText(runPaths(cfg.runsDir, meta.runId).err, 4096)).trim();
+  const detail = [stderr, state.otherOutput.trim()].filter(Boolean).join("\n");
+  const code = exit.code === undefined ? "" : ` (exit code ${exit.code})`;
+  return new AgyRunError(
+    `agy stopped without an answer${code}${detail ? `: ${detail}` : "."}`,
+    sessionId,
+  );
+}
+
+async function readText(file: string, maxChars = 256 * 1024): Promise<string> {
+  let handle;
+  try {
+    handle = await open(file, "r");
+  } catch {
+    return "";
+  }
+  try {
+    // A long run's log can grow large; quota lines are near its end.
+    const { size } = await handle.stat();
+    const length = Math.min(size, maxChars);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    return buffer.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+  });
 }

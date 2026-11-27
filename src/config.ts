@@ -1,3 +1,5 @@
+import { DEFAULT_RUNS_DIR } from "./runs.js";
+
 export interface Config {
   agyPath: string;
   timeoutSec: number;
@@ -14,6 +16,13 @@ export interface Config {
   skipPermissions: boolean;
   sandbox: boolean;
   onFailure: "strict" | "fallback";
+  /**
+   * How long a call waits for agy's answer before handing back the session id
+   * for get_result. Keep it below the MCP client's tool timeout.
+   */
+  waitSec: number;
+  /** Where each run's stream, stderr and log are kept. */
+  runsDir: string;
 }
 
 function positiveInt(raw: string | undefined, fallback: number): number {
@@ -44,5 +53,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     skipPermissions: env.AGY_SKIP_PERMISSIONS !== "false",
     sandbox: env.AGY_SANDBOX === "true",
     onFailure: env.AGY_ON_FAILURE === "strict" ? "strict" : "fallback",
+    waitSec: positiveInt(env.AGY_WAIT_SEC, 240),
+    runsDir: env.AGY_RUNS_DIR || DEFAULT_RUNS_DIR,
   };
 }
