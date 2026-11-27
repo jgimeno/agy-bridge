@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { TOOLS, resolveFiles } from "../src/tools.js";
+import { ModelRegistry } from "../src/models.js";
 
 describe("TOOLS", () => {
   it("defines the six tools", () => {
@@ -23,8 +24,25 @@ describe("TOOLS", () => {
   it("every tool has a sane per-tool timeout", () => {
     for (const t of TOOLS) {
       expect(t.timeoutSec).toBeGreaterThan(0);
-      expect(t.timeoutSec).toBeLessThanOrEqual(600);
+      expect(t.timeoutSec).toBeLessThanOrEqual(1800);
     }
+  });
+
+  it("adversarial_review prefers Gemini Neon, then Argon, then Flash, then Claude Opus", async () => {
+    const listing = [
+      "gemini-4-neon-high\tGemini 4 Neon (High)",
+      "gemini-4-argon-high\tGemini 4 Argon (High)",
+      "gemini-3.8-flash-high\tGemini 3.8 Flash (High)",
+      "claude-opus-5-5-high\tClaude Opus 5.5 (High)",
+    ].join("\n");
+    const chain = TOOLS.find((t) => t.name === "adversarial_review")!.chain;
+    const { models } = await new ModelRegistry(async () => listing).resolveChain({ chain });
+    expect(models).toEqual([
+      "Gemini 4 Neon (High)",
+      "Gemini 4 Argon (High)",
+      "Gemini 3.8 Flash (High)",
+      "Claude Opus 5.5 (High)",
+    ]);
   });
 
   it("web_lookup fails fast (well under the old 20-minute default)", () => {

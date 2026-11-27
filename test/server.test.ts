@@ -153,6 +153,13 @@ describe("createToolHandler", () => {
     );
   });
 
+  it("a call's timeout_sec wins over every configured timeout", async () => {
+    const f = fakeDeps();
+    const cfg = { timeoutSec: 900, timeoutExplicit: true, perToolTimeouts: { deep_search: 300 } };
+    await handlerFor("deep_search", f, cfg)({ query: "q", timeout_sec: 2400 });
+    expect(f.runs[0].args[f.runs[0].args.indexOf("--print-timeout") + 1]).toBe("2400s");
+  });
+
   it("per-tool override wins over explicit global AGY_TIMEOUT", async () => {
     const f = fakeDeps();
     const cfg = { timeoutSec: 900, timeoutExplicit: true, perToolTimeouts: { deep_search: 300 } };
