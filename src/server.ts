@@ -108,6 +108,7 @@ export function createToolHandler(
 export function createResultHandler(
   cfg: Config,
   deps: RunnerDeps = defaultDeps,
+  cooldowns: CooldownRegistry = new CooldownRegistry(),
 ): (args: Record<string, unknown>, extra?: HandlerExtra) => Promise<ToolResponse> {
   return async (args, extra) => {
     try {
@@ -115,6 +116,18 @@ export function createResultHandler(
       const waitSec = (args.wait_sec as number | undefined) ?? cfg.waitSec;
       return formatOutcome(await collectRun(sessionId, waitSec, cfg, deps, extra?.signal), []);
     } catch (err) {
+      // get_result doesn't have the prompt to fail over with, so the caller re-runs
+      // the tool, which then skips the exhausted model.
+      if (err instanceof QuotaError && err.model) {
+        cooldowns.set(err.model, err.resetSeconds);
+        return formatError(
+          new Error(
+            `${err.message} It ran out while agy was working, so this run has no answer. ` +
+              `Run the original tool call again: it will go to the next model in its chain.`,
+          ),
+          cfg,
+        );
+      }
       return formatError(err, cfg);
     }
   };
@@ -201,7 +214,7 @@ export function createServer(): McpServer {
           ),
       },
     },
-    createResultHandler(cfg, defaultDeps),
+    createResultHandler(cfg, defaultDeps, cooldowns),
   );
   return server;
 }
