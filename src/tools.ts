@@ -23,6 +23,17 @@ const commonShape = {
       'Override the model: a name or id from `agy models`, or a `*` version pattern such as "Gemini * Pro (High)". ' +
         "Normally omit — the tool routes automatically.",
     ),
+  timeout_sec: z
+    .number()
+    .int()
+    .positive()
+    .max(7200)
+    .optional()
+    .describe(
+      "agy's time limit for this call, in seconds; overrides AGY_TIMEOUT and the tool's default. " +
+        "Normally omit. The call itself returns after AGY_WAIT_SEC either way; a longer run " +
+        "hands back a session_id for get_result.",
+    ),
 };
 
 export interface ToolDef {
@@ -30,13 +41,17 @@ export interface ToolDef {
   description: string;
   schema: z.ZodRawShape;
   chain: string[];
-  /** Default --print-timeout for this tool, in seconds. AGY_TIMEOUT overrides. */
+  /** Default --print-timeout for this tool, in seconds. timeout_sec, AGY_TIMEOUT_<TOOL> and AGY_TIMEOUT override it. */
   timeoutSec: number;
   buildPrompt(args: Record<string, unknown>, cwd: string): string;
 }
 
 // Gemini first, always; other families only when no Gemini model is listed at all.
-const NON_GEMINI_FALLBACK = ["Claude Opus * (Thinking)", "GPT-OSS 120B (Medium)"];
+const NON_GEMINI_FALLBACK = [
+  "Claude Opus * (Thinking)",
+  "Claude Opus * (High)",
+  "GPT-OSS 120B (Medium)",
+];
 
 export const TOOLS: ToolDef[] = [
   {
@@ -54,7 +69,12 @@ export const TOOLS: ToolDef[] = [
       question: z.string().describe("What you want to know about these files."),
       ...commonShape,
     },
-    chain: ["Gemini * Flash (High)", "Gemini * Pro (Low)", ...NON_GEMINI_FALLBACK],
+    chain: [
+      "Gemini * Flash (High)",
+      "Gemini * Argon (Low)",
+      "Gemini * Pro (Low)",
+      ...NON_GEMINI_FALLBACK,
+    ],
     timeoutSec: 300,
     buildPrompt(args, cwd) {
       const files = resolveFiles(args.files as string[], cwd);
@@ -105,7 +125,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "adversarial_review",
     description:
-      "Get an adversarial second opinion from a different model family (Gemini Pro). " +
+      "Get an adversarial second opinion from a different model family (Gemini). " +
       "ALWAYS use this for plan critiques, design reviews, and pre-merge code review: " +
       "it hunts for flaws, edge cases, security issues, and unstated assumptions you may have missed.",
     schema: {
@@ -120,8 +140,15 @@ export const TOOLS: ToolDef[] = [
       focus: z.string().optional().describe("Optional focus area, e.g. 'security', 'concurrency'."),
       ...commonShape,
     },
-    chain: ["Gemini * Pro (High)", "Gemini * Flash (High)", ...NON_GEMINI_FALLBACK],
-    timeoutSec: 300,
+    // Reviews explore the repo (git, reads, greps) and run for many minutes.
+    chain: [
+      "Gemini * Neon (High)",
+      "Gemini * Argon (High)",
+      "Gemini * Pro (High)",
+      "Gemini * Flash (High)",
+      ...NON_GEMINI_FALLBACK,
+    ],
+    timeoutSec: 1800,
     buildPrompt(args, cwd) {
       const files = args.files as string[] | undefined;
       const content = args.content as string | undefined;
@@ -154,7 +181,7 @@ export const TOOLS: ToolDef[] = [
       ...commonShape,
     },
     chain: [],
-    timeoutSec: 300,
+    timeoutSec: 1200,
     buildPrompt(args) {
       return args.question as string;
     },
