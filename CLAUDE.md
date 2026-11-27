@@ -12,6 +12,10 @@ come back. Prefer delegating over doing it yourself when:
   model family catches what you miss)
 - **Follow-up question on a prior delegation** → `follow_up` with the returned
   session id (never resend the context)
+- **A call says agy is still working** → `get_result` with its session id, as
+  often as needed; never redo the work yourself meanwhile
+- **A call failed but named a session** → `follow_up` on that session can ask
+  for its answer so far
 
 Do NOT delegate: small single-file edits, questions you can answer from
 context already loaded, or tasks needing tools only you have.
